@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+instaloader>=4.12
+python-dotenv>=1.0
+# нужен только при IG_LIKE=true (лайк в Instagram); при IG_LIKE=false можно не ставить
+instagrapi>=2.1
