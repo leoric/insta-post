@@ -672,10 +672,14 @@ def describe_error(e: BaseException) -> str:
     return _short_error(e)
 
 
-async def process_post(context: ContextTypes.DEFAULT_TYPE, status, url: str, text: str):
-    """Скачать -> опубликовать в канал -> реакция -> лайк. status — сообщение, которое обновляем."""
+async def process_post(context: ContextTypes.DEFAULT_TYPE, status, url: str, text: str, origin=None):
+    """Скачать -> опубликовать в канал -> реакция -> лайк.
+    status — сообщение, которое обновляем; origin — исходное сообщение со ссылкой, на него бот
+    отвечает при ошибке (чтобы в потоке из многих ссылок было видно, какая не прошла)."""
     code = SHORTCODE_RE.search(url).group(1)
     t0 = time.monotonic()
+    if publish_lock.locked():
+        await safe_edit(status, "🕓 В очереди…")
     async with publish_lock:
         log.info("[%s] ▶ Старт. Текст: %d симв.", code, len(text))
         tmp = Path(tempfile.mkdtemp(prefix="igbot_"))
@@ -723,12 +727,22 @@ async def process_post(context: ContextTypes.DEFAULT_TYPE, status, url: str, tex
             err = describe_error(e) or type(e).__name__
             if len(err) > 400:
                 err = err[:400] + "…"
+            err_text = f"❌ Не опубликовано: {url}\n{err}"
+            no_preview = LinkPreviewOptions(is_disabled=True)
             try:
-                await safe_edit(
-                    status, f"❌ Ошибка: {err}", link_preview_options=LinkPreviewOptions(is_disabled=True)
-                )
+                # Новое сообщение-ответ на ссылку: приходит уведомлением и показывает цитату
+                # исходного сообщения, в отличие от правки статуса, которую легко не заметить
+                await (origin or status).reply_text(err_text, link_preview_options=no_preview)
+                try:
+                    await status.delete()
+                except Exception:  # noqa: BLE001
+                    await safe_edit(status, "❌ Ошибка, см. ответ ниже")
             except Exception:
-                log.exception("[%s] не удалось показать ошибку в чате", code)
+                log.exception("[%s] не удалось отправить ответ с ошибкой, правлю статус", code)
+                try:
+                    await safe_edit(status, err_text, link_preview_options=no_preview)
+                except Exception:
+                    log.exception("[%s] не удалось показать ошибку в чате", code)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -741,7 +755,7 @@ async def flush_pending(user_id: int, context: ContextTypes.DEFAULT_TYPE, reason
     if p["task"] is not asyncio.current_task():
         p["task"].cancel()
     log.info("Ожидающий пост %s уходит без текста (%s)", p["url"], reason)
-    await process_post(context, p["status"], p["url"], "")
+    await process_post(context, p["status"], p["url"], "", p.get("origin"))
 
 
 async def _pending_timeout(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -774,11 +788,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text:
             status = await msg.reply_text("⏳ Скачиваю…")
-            await process_post(context, status, url, text)
+            await process_post(context, status, url, text, msg)
         else:
             status = await msg.reply_text(f"🔗 Ссылка принята, жду текст ({PENDING_TIMEOUT:.0f} с)…")
             task = context.application.create_task(_pending_timeout(user.id, context))
-            pending[user.id] = {"url": url, "status": status, "task": task}
+            pending[user.id] = {"url": url, "status": status, "task": task, "origin": msg}
             log.info("[%s] Жду текст следующим сообщением (до %.0f с)", code, PENDING_TIMEOUT)
         return
 
@@ -788,7 +802,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p["task"].cancel()
         text = msg.text.strip()
         log.info("📩 Сообщение от %s: текст %d симв. — к ожидающей ссылке %s", user.id, len(text), p["url"])
-        await process_post(context, p["status"], p["url"], text)
+        await process_post(context, p["status"], p["url"], text, p.get("origin"))
     else:
         log.info("📩 Сообщение от %s без ссылки и без ожидающего поста — игнорирую", user.id)
         await msg.reply_text("Пришли ссылку на пост Instagram и текст (в том же сообщении или следующим).")
