@@ -24,8 +24,10 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -49,6 +51,59 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 for _noisy in ("httpx", "httpcore", "hpack"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("ig_repost_bot")
+
+
+class ConnectionWatchdog(logging.Handler):
+    """Флажок «были проблемы»: любой WARNING поднимает его, первый же INFO опускает.
+    Если флажок остаётся поднятым CHECK_AFTER секунд (за это время не было ни одного INFO),
+    фоновый поток проверяет соединение с Telegram и пишет результат в лог как INFO —
+    эта запись сама опускает флажок."""
+
+    CHECK_AFTER = 60  # секунд
+    HOST = ("api.telegram.org", 443)
+    CHECK_TIMEOUT = 5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = threading.Lock()
+        self._raised_at: float | None = None  # monotonic-время подъёма флажка; None — опущен
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with self._state_lock:
+            if record.levelno == logging.WARNING:
+                if self._raised_at is None:  # повторные warning таймер не сбрасывают
+                    self._raised_at = time.monotonic()
+            elif record.levelno == logging.INFO:
+                self._raised_at = None
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="conn-watchdog", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(1)
+            with self._state_lock:
+                raised_at = self._raised_at
+            if raised_at is not None and time.monotonic() - raised_at >= self.CHECK_AFTER:
+                self._check_connection()  # запись INFO внутри опускает флажок
+
+    def _check_connection(self) -> None:
+        host, port = self.HOST
+        started = time.monotonic()
+        try:
+            with socket.create_connection(self.HOST, timeout=self.CHECK_TIMEOUT):
+                pass
+        except OSError as e:
+            log.info("Проверка соединения: %s:%d недоступен: %s: %s", host, port, type(e).__name__, e)
+        else:
+            log.info(
+                "Проверка соединения: %s:%d доступен (%d мс)",
+                host, port, (time.monotonic() - started) * 1000,
+            )
+
+
+WATCHDOG = ConnectionWatchdog()
+logging.getLogger().addHandler(WATCHDOG)
 
 
 def env_flag(name: str, default: str = "true") -> bool:
@@ -772,6 +827,7 @@ async def post_init(application: Application):
 
 
 def main():
+    WATCHDOG.start()
     ensure_login(LOADER)
     if not has_session():
         log.warning("Работаю без входа в Instagram: возможны ошибки 401/403%s", "; лайк работать не будет" if IG_LIKE else "")
